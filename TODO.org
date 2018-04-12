@@ -1,0 +1,13 @@
+* capabilities
+** producing to a compacted topic
+** generating a sstable index using goka (sse-grep, grep-streams, grep-stream-seq)
+** reading a topic to a global map
+** producing to partitions/custom key
+** consuming from configured list of data topics
+
+** *reading* a sstable index for a partition (grep-streams)
+** copartitioned consumption
+** key filters: globs/regex
+** data filters: jsonql/mongo
+** *reading* a sstable index for the whole topic (grep-cursor)
+** consuming from a partition (sse-grep)
