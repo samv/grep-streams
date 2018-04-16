@@ -204,11 +204,14 @@ func (gs *GrepStream) SinkMessage(message *kafka.Message) {
 }
 
 func (gsAPI GrepStreamsAPI) TimeoutMS() int {
+	var timeout int
 	if gsAPI.Timeout == 0 {
-		return 5000
+		timeout = 10000
 	} else {
-		return int(gsAPI.Timeout / time.Millisecond)
+		timeout = int(gsAPI.Timeout / time.Millisecond)
 	}
+	log.Printf("Returning %d for timeout", timeout)
+	return timeout
 }
 
 func (gsAPI *GrepStreamsAPI) Consume(doneCB func()) {
@@ -216,6 +219,7 @@ func (gsAPI *GrepStreamsAPI) Consume(doneCB func()) {
 	consumer, err := kafka.NewConsumer(
 		&kafka.ConfigMap{
 			"bootstrap.servers":               strings.Join(gsAPI.Brokers, ","),
+			"client.id":                       "grep-streams",
 			"group.id":                        gsAPI.GroupName,
 			"session.timeout.ms":              gsAPI.TimeoutMS(),
 			"go.events.channel.size":          gsAPI.ConsumerChannelDepth,
@@ -230,7 +234,10 @@ func (gsAPI *GrepStreamsAPI) Consume(doneCB func()) {
 		panic("Failed to start consumer: " + err.Error())
 	}
 
-	consumer.Subscribe(gsAPI.StreamTopic, nil)
+	err = consumer.Subscribe(gsAPI.StreamTopic, nil)
+	if err != nil {
+		panic("Failed to subscribe: " + err.Error())
+	}
 
 	// TODO - allow multiple return partitions (one per pod with a
 	// global assignment map, or consistent hashing from NodeName)
@@ -273,6 +280,7 @@ func (gsAPI *GrepStreamsAPI) Consume(doneCB func()) {
 func main() {
 	grepStreamsAPI := GrepStreamsAPI{
 		StreamTopic:       "greps",
+		GroupName:         "grouppy",
 		NodeName:          "greppy",
 		Brokers:           []string{"localhost:9092"},
 		WriteChannelDepth: 10,
