@@ -1,5 +1,28 @@
 * capabilities
-** producing to a compacted topic
+** DONE producing to a compacted topic
+
+- create topic with eg
+
+    kafka-topics --zookeeper=localhost:2181 --create --topic grep_match --replication-factor 1 --partitions 4 --config cleanup.policy=compact
+
+Current version produces messages:
+
+    $ kafkacat -b localhost:9092 -t sse_in_grep -f 'Topic %t [%p] at offset %o: key %k: %s\n'
+    Topic sse_in_grep [3] at offset 4: key {"Topic":"greps","Partition":0,"GrepStreamID":"localhost:[::1]:55892+1","Filter":".*"}: {"StartTime":"2018-04-16T21:47:51.156804018-07:00","LastObjectID":"","WindowSize":128}
+    Topic sse_in_grep [3] at offset 5: key {"Topic":"greps","Partition":1,"GrepStreamID":"localhost:[::1]:55892+1","Filter":".*"}: {"StartTime":"2018-04-16T21:47:51.156804018-07:00","LastObjectID":"","WindowSize":128}
+
+Manually produce a stream message:
+
+    $ printf "localhost:[::1]:55892+1\t[\"Hello, streams\"]" | kafkacat -b localhost:9092 -t sse_out_grep -p 0 -K"  "
+    % Auto-selecting Producer mode (use -P or -C to override)
+
+In browser:
+
+    :-)
+    data: ["Hello, streams"]
+
+    :-)
+
 ** generating a sstable index using goka (sse-grep, grep-streams, grep-stream-seq)
 ** reading a topic to a global map
 ** producing to partitions/custom key

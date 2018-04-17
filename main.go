@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -37,6 +40,9 @@ type GrepStreamsAPI struct {
 	DoneChanDepth        int
 	ConsumerChannelDepth int
 
+	// default window size for cursors
+	DefaultWindowSize int64
+
 	// Timeout is the default timeout for the kafka consumer
 	Timeout time.Duration
 
@@ -49,12 +55,20 @@ type GrepStreamsAPI struct {
 
 	// doneChan communicates streams that are closed
 	doneChan chan string
+
+	// producer is for outgoing events from the GSAPI component
+	producer *kafka.Producer
 }
 
 // GrepStream is a single stream of events being grep'd to a single
 // SSE channel
 type GrepStream struct {
 	StreamID      string
+	Topic         string
+	Partitions    int
+	Filter        string
+	LatestEpoch   time.Time
+	LastEventID   string
 	SinkChanDepth int
 	messageChan   chan *kafka.Message
 	sinkChan      chan<- sse.SinkEvent
@@ -94,18 +108,40 @@ func (gsAPI *GrepStreamsAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.RemoteAddr
 
 	// for connect, want to get;
-	//   - topic - from path
+	//   - topic - from path (this handler will be bound to a resource
+	//                        or attached to another stream)
+	grepTopic := "greps"
+	grepPartitions := 4
+
 	// path := r.URL.Path
 	//   - partid - need topic/source awareness
+	parts := strings.SplitN(r.URL.Path[1:], "/", 2)
+	filter := parts[0]
+	if filter == "" {
+		filter = ".*"
+	}
+
 	//   - pod/socketid - assign (chanID)
 	//   - filter/jsonql - from input form and/or path
-	// formValues := r.URL.Query()
+
+	// how far back to look?
+	formValues := r.URL.Query()
+	since, err := time.ParseDuration(formValues.Get("since"))
+	if err != nil || since < 0 {
+		since = 0
+	}
+
 	//   - windowsize - spread over all connections
 	var gs GrepStream
 	gs.StreamID = fmt.Sprintf("%s:%s+%d", gsAPI.NodeName, remoteAddr, gsAPI.socketID(remoteAddr))
 	gs.messageChan = make(chan *kafka.Message, gsAPI.WriteChannelDepth)
 	gs.SinkChanDepth = gsAPI.SinkChanDepth
 	gs.doneChan = gsAPI.doneChan
+	gs.Topic = grepTopic
+	gs.Partitions = grepPartitions
+	gs.Filter = filter
+	gs.LatestEpoch = time.Now().Add(since)
+	gs.LastEventID = r.Header.Get("Last-Event-ID")
 
 	// set up the write socket
 	gsAPI.Lock()
@@ -118,7 +154,85 @@ func (gsAPI *GrepStreamsAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	gsAPI.Unlock()
 
+	// produce connect message(s) (map)
+	gsAPI.SendSSEInGrepMsgs(&gs)
+
 	sse.SinkEvents(w, http.StatusOK, &gs)
+}
+
+// KeySSEInGrep is the key type for the 'sse_in_grep' topic
+type KeySSEInGrep struct {
+	Topic        string
+	Partition    int32
+	GrepStreamID string // SSE channel ID - pod+remoteaddr+channel
+	Filter       string // TODO - these might be big; pass ones larger than a sha1 by reference
+	// JSONQL    string  // later
+}
+
+var topicSSEInGrep = "sse_in_grep"
+
+// this is how librdkafka chooses partitions from a key.
+var rdKafkaCRC32 = crc32.MakeTable(0x04c11db7)
+
+func choosePartition(key interface{}, partitions int32) int32 {
+	var modulus int32 = 1
+	if partitions > 1 && partitions <= math.MaxInt32 {
+		modulus = int32(partitions)
+	}
+	// this algorithm is not "consistent" in a "consistent hashing" way :-/
+	return int32(crc32.Checksum(mustEncode(key), rdKafkaCRC32) % uint32(modulus))
+}
+
+func mustEncode(val interface{}) []byte {
+	valBytes, err := json.Marshal(val)
+	if err != nil {
+		panic(fmt.Sprintf("error marshaling %#v: %v", val, err))
+	}
+	return valBytes
+}
+
+func (keySSEInGrep KeySSEInGrep) TopicPartition() kafka.TopicPartition {
+	return kafka.TopicPartition{
+		Topic: &topicSSEInGrep,
+	}
+}
+
+// ValueSSEInGrep is the value type for the 'sse_in_grep' topic
+type ValueSSEInGrep struct {
+	StartTime    time.Time
+	LastObjectID string
+	WindowSize   int64
+}
+
+// SendSSEInGrepMsgs sends out messages to sse_in_grep - one for each partition and topic
+// being grep'd
+func (gsAPI *GrepStreamsAPI) SendSSEInGrepMsgs(gs *GrepStream) {
+	key := KeySSEInGrep{
+		Topic:        gs.Topic,
+		GrepStreamID: gs.StreamID,
+		Filter:       gs.Filter,
+	}
+	value := ValueSSEInGrep{
+		StartTime:    gs.LatestEpoch,
+		LastObjectID: gs.LastEventID,
+		WindowSize:   gsAPI.DefaultWindowSize,
+	}
+	valueBytes := mustEncode(value)
+	for partNum := 0; partNum < gs.Partitions; partNum++ {
+		topicPartition := key.TopicPartition()
+		topicPartition.Partition = choosePartition(
+			[]interface{}{key.Topic, partNum, key.Filter},
+			4, // TODO - discover partitions in sse_in_grep
+		)
+		key.Partition = int32(partNum)
+		gsAPI.producer.ProduceChannel() <- &kafka.Message{
+			TopicPartition: topicPartition,
+			Key:            mustEncode(key),
+			Value:          valueBytes,
+			// Opaque:      gs,  // useful?
+			// Headers:     ...  // trace info, client headers...?
+		}
+	}
 }
 
 // GetEventChan is a callback for making an SSE feed.  It is passed in
@@ -259,36 +373,60 @@ func (gsAPI *GrepStreamsAPI) Consume(doneCB func()) {
 			switch event := event.(type) {
 			case *kafka.Message:
 				if bytes.HasPrefix(event.Key, ourPrefix) {
-					streamID := string(event.Key[len(ourPrefix):])
+					streamID := string(event.Key)
 					stream := gsAPI.getStream(streamID)
 					if stream != nil {
 						stream.SinkMessage(event)
 					} else {
-						log.Printf("no such client: %s", string(streamID))
+						log.Printf("GSAPI(C): no such client: %s", string(streamID))
 					}
 				} else {
-					log.Printf("ignoring message to key: %s", string(event.Key))
+					log.Printf("GSAPI(C): ignoring message to key: %s", string(event.Key))
 				}
 				consumer.CommitMessage(event)
 			default:
-				log.Printf("read a non-message event: %s", event)
+				log.Printf("GSAPI(C): read a non-message (%T) event: %s", event, event)
 			}
+		}
+	}
+}
+
+func (gsAPI *GrepStreamsAPI) Produce() {
+	var err error
+	gsAPI.producer, err = kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": strings.Join(gsAPI.Brokers, ",")})
+	if err != nil {
+		panic("Failed to start producer: " + err.Error())
+	}
+
+	for e := range gsAPI.producer.Events() {
+		switch ev := e.(type) {
+		case *kafka.Message:
+			if ev.TopicPartition.Error != nil {
+				fmt.Printf("GSAPI(P): delivery failed: %v\n", ev.TopicPartition.Error)
+			} else {
+				fmt.Printf("GSAPI(P): delivered message to topic %s [%d] at offset %v\n",
+					*ev.TopicPartition.Topic, ev.TopicPartition.Partition, ev.TopicPartition.Offset)
+			}
+		default:
+			log.Printf("GSAPI(P): read a non-message (%T) event: %s", ev, ev)
 		}
 	}
 }
 
 func main() {
 	grepStreamsAPI := GrepStreamsAPI{
-		StreamTopic:       "greps",
-		GroupName:         "grouppy",
-		NodeName:          "greppy",
+		StreamTopic:       "sse_out_grep",
+		GroupName:         "grep-streams",
+		NodeName:          "localhost",
 		Brokers:           []string{"localhost:9092"},
-		WriteChannelDepth: 10,
-		SinkChanDepth:     10,
-		DoneChanDepth:     5,
+		WriteChannelDepth: 10,  // consumer -> sink() loop buffer
+		SinkChanDepth:     0,   // i.e., don't ack messages that haven't been written to TCP window
+		DoneChanDepth:     5,   // non-zero allows goroutines to exit sooner
+		DefaultWindowSize: 128, // tiny for testing
 	}
 	server := http.Server{Handler: &grepStreamsAPI, Addr: ":8443"}
 	go grepStreamsAPI.Consume(func() { server.Close() })
+	go grepStreamsAPI.Produce()
 	err := server.ListenAndServeTLS("localhost.crt", "localhost.key")
 	if err != nil {
 		log.Printf("unclean shutdown! err=%v\n", err)
