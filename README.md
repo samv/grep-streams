@@ -58,7 +58,7 @@ are marked with (+).
  * <= `grep_match` (PK)
  * => `grep_match_seq`(+) - PartKey: <topic:filterid>
 * grep cursor - implements scrollable `grep_match_seq` cursors
- * <= `sse_in_grep` (g)
+* <= `sse_in_grep` (g)
  * <= `sse_ack_grep` (PK+CP,ss)
  * <= `grep_match_seq` (PK+CP,ss)
  * => `sse_out_grep` - PartKey: <pod>
@@ -77,7 +77,7 @@ input topic flags:
 (PK+CP) - copartitioned consumption
 (ss) - partitioned sorted string table (looked up from end)
 
-# sse-grep
+# sse-grep ("map")
 
 This is an incoming HTTP service.  It gets the request, sends network
 events to topics and consumes messages from its outbound topic.  Its
@@ -100,94 +100,76 @@ Consumes:
 
   * `sse_out_grep` - messages for it to write to clients!
 
-#### `sse_ack_grep` index subworker
-
-This subworker consumes state written to the `sse_ack_grep` topic and
-writes out a sorted string table index (using leveldb).  This index
-allows the write pump to be able to stick to one eventstream partition
-(partition key is <topic:filter:jsonql>)
-
-When the write pump notices a previously unknown or blocked client has
-window to receive, it needs to be able to look up the last ack'd
-eventID, which it looks up in the event stream index.
-
-So, the string key is the event stream and client.
-
-    topic:filter:jsonq:<pod:socketid>
-
-#### `sse_in_grep` index aggregator
-
-count(distinct pod:socketid) by filter+jsonql, using a tumbling window
-Something like this will allow 'least frequently used' expiry, for
-cleaning up the `grep_match` topic.
-
 ### Grep-Streams:
 
-This is the main worker that scours kafka for matching rows.  It keeps
-track of client subscriptions to know what to search for.  It's
-assumed that any index with an active subscription is eligible for
-emitting a matching bitmap for.
+This is the live worker that scours kafka for matching rows.  It keeps
+track of client subscriptions to know what patterns to search for.
+It's assumed that any index with an active/recent subscription is eligible
+for emitting `grep_match` messages.
 
-Consumes (each 'grep-streams' worker consumes global tables):
+Consumes via (global) lookup table:
 
-  * `sse_in_grep<leveldb>`
+  * `sse_in_grep`
+  * `grep_filters`
 
-Consumes the 'grep_match' index written by Grep Stream Sequencer, below.  This is
-so when it resumes, it can access the most recent 'grep_match' bitmap so
-it knows where to resume in each partition for the filter/jsonql.
+This allows grep-streams to know which topics to search for, and what
+filters to apply (and hence, `grep_match` events to emit).
 
-  * `grep_match_idx` (for validating/starting new searches)
-
-The main consumption can first know the earliest and latest requested
-index for each partition when it starts.  It can service searches from
-all time ranges concurrently, as each is writing 'grep_match' index
-segments.  Once they overlap the results will converge into a single
-bitmap.
+Consumes:
 
   * all defined/discovered kafka topics (weighted to local leader partitions)
 
-For the very first '-1hr' use case, it needs to scan the partition,
-binary search for the time, and then write the first 'grep_match'
-message for the offset it found.
+So, grep-streams is consuming all topics and joining them against
+`sse_in_grep`.  It is up to the cursor to tell whether this data is
+current enough or whether a back search is required.
 
 Produces:
 
-  * 'grep_match' topic - compacted topic, key [topic:partid:filter:jsonql:epoch] to [[]<offset, size>]
-    - ideally partitioned over topic:filter:jsonql (so that
-      'serializer' can have good affinity)
-    - can combine indices to 1k events or expire old unwanted indices
-      using tombstones
+  * 'grep_match' topic - log, key [topic:filter:partid:timestr] to [[]<delta offset, size>]
+    - partitioned over topic:filter:jsonql (so that 'serializer' can have good affinity)
+    - new searches write an empty list with the first offset searched in the topic/partition as key
+    - row matches write an absolute offset and size
 
-This index can be stored with variable length integer encoding, and
-the 'offset' is the offset since the previous epoch.
+  * maybe `grep_match` should be a log
 
-Takes key filters and data jsonql expressions and filters topics to
-produce a 'bitmap' index.  It watches "sse_in_grep" to see which indexes
-need to be built.`
+### Grep Stream Sequencer ("reduce")
 
-### Grep Stream Sequencer
+consumes:
+  * `grep_match` (partitioned over topic:filterid)
 
-Grep Stream Sequencer combines all of the `grep_out` rows for the filter and
-assigns them a sequence number.  This allows clients to send 'last
-event ID' for a stream, and get exactly once delivery of their
-messages.
+View of:
+  * `grep_match_epoch` topic (also written)
 
-consumes (clustered over)
-  * `grep_match` topic
+emits:
+  * `grep_match` topic - periodically compacted ranges and tombstones
 
-produces:
-  * `grep_match_idx` - ktable/leveldb index of 'grep_match' topic keys + msg_timestamp
+Local State:
+  * buffer of grep_match rows which could not be written to
+    `grep_match_seq` because bounding epochs were not available
+    (including deep scans)
 
-Grep Stream Sequencer also produces `grep_match_seq` messages.
+Grep Stream Sequencer combines all of the `grep_match` rows for the
+filter and assigns matches in streams with an epoch sequence numbers.
+This allows clients to send 'last event ID' for a stream, and get
+exactly once delivery of their messages.
+
+It's possible that due to an infrequently used filter, there will be
+gaps with no match data between ranges.  Empty matches written by
+grep-streams are collected and once all partitions are seen, worst
+case sequences can be generated (i.e., assuming that every message is
+a match).
+
+Grep Stream Sequencer produces `grep_match_seq` messages
 
   * `grep_match_seq` - log of [topic:filter:jsonql:epoch] to [[]<eventid:partid:offset:size>]
     - ideally partitioned over <topic:filter:jsonql>
 
-#### subworkers
+And `epoch` for slices across topics when the '0' event (or other) for
+a search happened:
 
-goka consumer of grep_match_seq writing to `grep_match_seq_idx`
-ktable-style store.  This is so that the write pump can handle sockets
-which can't receive all the objects at once.
+  * `grep_match_epoch` - map of [topic:filter:eventid] to [time,[]<partid:offset>]
+
+Periodic sync'ing is probably also useful.
 
 ### Grep Cursor
 
@@ -196,38 +178,130 @@ The grep cursor implements flow control - it follows `sse_ack_grep` and
 message address (topic+partition+offset) & sizes to `sse_out_grep`
 as the matches come in.
 
-consumes (global map):
-  * `sse_in_grep<leveldb>`
+Things not going well, it punts requests for old ranges to grep-logs
 
-consumes (lazy, cached sstable):
-  * `grep_match_seq_idx`
-  * `sse_ack_grep_idx`
+consumes via global lookup table:
+  * `sse_in_grep`
 
-consumes (partitioned over):
+consumes/joins (partitioned over <topic:filter>):
   * `grep_match_seq`
   * `sse_ack_grep`
 
+state:
+  * bound window of `grep_match_seq` vs `sse_ack_grep` & recent history
+
 produces:
   * `sse_out_grep` - log of <pod> to [topic:filter:jsonql,[]<eventid:partid:offset:size>,[]socketid]
+     - also status/progress updates & estimates for old queries
+  * `grep_log` - 'exception' when a filter is requesting a range not in the window
+     - request to search by time range and topic, with possible
+       exclusions/starting offsets for particular partitions which already finished.
 
 Grep Cursor processes the `grep_match_seq` with `sse_in_grep` as a
 global, and tries to send events to `sse_out_grep` that it thinks will
-fit in its share of the window.  When it reads back `ack` messages, it
-will continue to cue `grep_match_seq_idx` and as messages it has sent
-to `sse_out_grep` are ack'd, it can cue further.
+fit in the window.
 
-On restart of this component, `sse_in_grep` is read from beginning
-(non-compacted rows only) and `sse_ack_grep` is accessed using the
-ktable/LevelDB index to see what the client last ack'd (TCP acks).
-The minimum of one SSE message or the window size bytes divided by the
-number of partitions are allowed to be outstanding (written to
-`sse_out_grep`, no ack seen on `sse_ack_grep`) at any time from each
-`grep_match_seq` partition.
+When it reads back `ack` messages, it will continue to cue
+`grep_match_seq_idx` and as messages it has sent to `sse_out_grep` are
+ack'd, it can cue further.
+
+When the grep cursor notices a previously unknown or blocked client
+has window to receive, it needs to be able to look up the last ack'd
+eventID, which it looks up in the 'grep match seq' table
+
+On failover of this component, `sse_in_grep` is read from beginning
+(non-compacted rows only) and `sse_ack_grep` is also recovered to see
+what the client last ack'd (TCP acks).  The minimum of one SSE message
+or the window size bytes divided by the number of partitions are
+allowed to be outstanding (written to `sse_out_grep`, no ack seen on
+`sse_ack_grep`) at any time from each `grep_match_seq` partition.
 
 Once the client is up to date (or if it started with eventid =
 latest), `grep_match_seq` rows can be sent live to the `sse_out_grep`
-topic, and so long as they are ack'd then the writepump can relay
+topic, and so long as they are ack'd then the grep cursor can relay
 messages straight from `grep_match_seq` to `sse_out_grep`.
+
+A "count" aggregating mode can be a special `sse_in_grep` flag which
+simply collects statistics (matches, bucketed sizes, etc) and relays
+progress update messages without sending the offsets.  With the cache
+this does not have to slow down querying, other than there being an
+extra delay before rows are started to be delivered.
+
+### Grep-logs:
+
+This worker services requests from the cursor for queries which were
+not in the range of `grep_match_epoch` indexes
+
+Consumes (lookup):
+  * `sse_in_grep`
+  * `grep_match_epoch`
+
+Consumes:
+  * `grep_log`
+
+grep-logs is servicing searches which look far into the past, not
+within an epoch start/stop window for a search.
+
+Like grep-streams, allocation is over the *source* data topics and
+prefers local leaders.  It services `grep_log` requests it receives,
+and emits `grep_match` blocks which are close to the window size
+requested in `grep_log`.  It is time bound, allowing the cursor to
+walk through deep time linearly and provide a meaningful progress bar,
+as well as the `grep_match_epoch` boundaries to be cleanly moved.
+
+It can service searches from all time ranges concurrently, as each is
+writing 'grep_match' index segments.  Once they overlap the results
+will converge into a single bitmap.
+
+### Grep cache
+
+Copartitioned consumption:
+
+  * `grep_match`
+  * `grep_match_seq`
+
+This *infrequently* commits `grep_cache`, which is a compacted
+version of `grep_match` with merged blocks of `grep_match`.
+
+This data should be committed infrequently once objects are large
+enough or a deadline passes; the cursor should have the most recent
+data anyway.  This needs to be used by grep-logs only.  Deadline may
+need to be kept at around 5-10s or less once until proven that no live
+searches will wait for it.
+
+`grep_cache` could be indexed again by an sstable which records
+strings to topic+pointers for faster recovery.
+
+This index can be stored with variable length integer encoding, and
+the 'offset' is the offset since the previous epoch.
+
+### Grep-index:
+
+This worker services requests from the cursor for queries which were
+within `grep_match_epoch`, meaning that there are rows in
+`grep_cache` for it.
+
+Consumes (lookup):
+  * `sse_in_grep`
+  * `grep_match_epoch`
+
+Consumes (partitioned over):
+  * `grep_cache` (or index of it)
+
+Consumes:
+  * `grep_log`
+
+grep-logs is servicing a client which is far enough behind that the
+cursor can't service it.  The first thing it can do is to scan
+`grep_cache` for the client which is behind, and if there are matches
+already there which are suitable, re-send (to `grep_match_seq`) a page
+of ranges to the cursor.
+
+#### subworkers
+
+goka consumer of grep_match_seq writing to `grep_match_seq_idx`
+ktable-style store.  This is so that the grep cursor can handle sockets
+which can't receive all the objects at once.
 
 ### Updog
 
@@ -244,3 +318,14 @@ consumes (globals):
 * `sse_in_grep<leveldb>`
 
 * sends tombstones to `sse_in_grep` for pods that disappear
+
+### Hounddog
+
+Stuff that hounds the data and cleans it up.
+
+#### `sse_in_grep` index aggregator
+
+count(distinct pod:socketid) by filter+jsonql, using a tumbling window
+Something like this will allow 'least frequently used' expiry, for
+cleaning up the `grep_match` topic.
+
