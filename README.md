@@ -4,6 +4,9 @@
 grep-streams is a scalable, fault tolerant and highly available,
 exactly once, stream processing version of grep(1).
 
+(warning: the statements below contain FAKE NEWS/unimplemented ideas.  This is
+a spare time project and I have very little spare time)
+
 grep-streams is a service which provides a way to search and subscribe
 to sequenced stream results in kafka, without being limited to reading
 all messages in a topic.  It sends the filter to the data, caches
