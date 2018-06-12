@@ -8,11 +8,15 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	goka "github.com/lovoo/goka"
+	// goka_confluent "github.com/lovoo/goka/kafka/confluent"
+	goka_storage "github.com/lovoo/goka/storage"
 	"github.com/samv/sse"
 )
 
@@ -169,6 +173,10 @@ type KeySSEInGrep struct {
 	// JSONQL    string  // later
 }
 
+func (kSIG KeySSEInGrep) String() string {
+	return fmt.Sprintf("%s:%d:%s:%s", kSIG.Topic, kSIG.Partition, kSIG.GrepStreamID, kSIG.Filter)
+}
+
 var topicSSEInGrep = "sse_in_grep"
 
 // this is how librdkafka chooses partitions from a key.
@@ -204,6 +212,19 @@ type ValueSSEInGrep struct {
 	WindowSize   int64
 }
 
+type JSONCodec struct {
+	Example interface{}
+}
+
+func (JSONCodec) Encode(value interface{}) (data []byte, err error) {
+	return json.Marshal(value)
+}
+func (jc JSONCodec) Decode(data []byte) (value interface{}, err error) {
+	value = reflect.New(reflect.TypeOf(jc.Example)).Interface()
+	err = json.Unmarshal(data, &value)
+	return
+}
+
 // SendSSEInGrepMsgs sends out messages to sse_in_grep - one for each partition and topic
 // being grep'd
 func (gsAPI *GrepStreamsAPI) SendSSEInGrepMsgs(gs *GrepStream) {
@@ -227,7 +248,7 @@ func (gsAPI *GrepStreamsAPI) SendSSEInGrepMsgs(gs *GrepStream) {
 		key.Partition = int32(partNum)
 		gsAPI.producer.ProduceChannel() <- &kafka.Message{
 			TopicPartition: topicPartition,
-			Key:            mustEncode(key),
+			Key:            []byte(key.String()),
 			Value:          valueBytes,
 			// Opaque:      gs,  // useful?
 			// Headers:     ...  // trace info, client headers...?
@@ -413,12 +434,140 @@ func (gsAPI *GrepStreamsAPI) Produce() {
 	}
 }
 
+type grepTopicPartition struct {
+	topic     string
+	partition int32
+}
+
+type kvSSEInGrep struct {
+	k KeySSEInGrep
+	v ValueSSEInGrep
+}
+
+type topicPartitionGreps struct {
+	Topic     string
+	Partition int32
+	Greps     []kvSSEInGrep
+}
+
+type SSEInGrepView struct {
+	sync.Mutex
+	clientID string
+	view     goka.View
+	greps    map[grepTopicPartition]*topicPartitionGreps
+	wg       *sync.WaitGroup
+}
+
+// KeyGrepMatch contanis the address of a match; the cursor uses this to cue
+type KeyGrepMatch struct {
+	Topic     string
+	Partition int32
+	Filter    string
+	Offset    kafka.Offset
+}
+
+func (kgm KeyGrepMatch) String() string {
+	// FIXME - this is not safe
+	return fmt.Sprintf("%s:%d:%s:%d", kgm.Topic, kgm.Partition, kgm.Filter, kgm.Offset)
+}
+
+// ValueGrepMatch represents either a marker to say that searching
+// started at an offset (len=0), a single match (len=1), or a
+// compacted list of matches from an index/grep-logs (len>1)
+type ValueGrepMatch []struct {
+	Offset uint64
+	Size   uint64
+}
+
+type kvGrepMatch struct {
+	k KeyGrepMatch
+	v ValueGrepMatch
+}
+
+// GrepMessage tests a message against the active greps
+func (topicPartGreps topicPartitionGreps) GrepMessage(offset kafka.Offset, size int64, key string, msg interface{}) []kvGrepMatch {
+	// ... evaluate all kvSSEInGrep messages against msg/key ...
+	var matches []kvGrepMatch
+	for _, kvGrep := range topicPartGreps.Greps {
+		if kvGrep.FilterMatch(key) {
+			matches = append(matches, kvGrepMatch{
+				k: KeyGrepMatch{topicPartGreps.Topic, topicPartGreps.Partition, kvGrep.k.Filter, offset},
+				v: ValueGrepMatch{{0, size}},
+			})
+		}
+	}
+	return matches
+}
+
+func NewSSEInGrepView(clientID, topic string, codec goka.Codec, brokers []string) *SSEInGrepView {
+	sseInGrepView := SSEInGrepView{
+		greps:    make(map[grepTopicPartition]*topicPartitionGreps),
+		clientID: clientID,
+	}
+	sseInGrepView.view = goka.NewView(brokers, goka.Table(topic), codec,
+		goka.WithViewCallback(sseInGrepView.Update),
+		goka.WithViewStorageBuilder(goka_storage.MemoryBuilder()),
+	)
+	return &sseInGrepView
+}
+
+func (sseInGrepView SSEInGrepView) Update(s goka_storage.Storage, partition int32, key string, value []byte) error {
+	// key is a KeySSEGrepIn
+
+	// value is a ValueSSEGrepIn
+
+	// throw into sseInGrepView.Greps (need lock)
+
+	// set in storage?  (??? how does it recover from local storage?)
+	return nil
+}
+
+func (sseInGrepView *SSEInGrepView) Start(wg *sync.WaitGroup) {
+	sseInGrepView.wg = wg
+	sseInGrepView.view.Start()
+}
+
+func (sseInGrepView SSEInGrepView) Stop() {
+	sseInGrepView.view.Stop()
+	if sseInGrepView.wg != nil {
+		sseInGrepView.wg.Done()
+	}
+}
+
+func (sseInGrepView *SSEInGrepView) grepTopic(topic string, codec goka.Codec, brokers []string) {
+	group := goka.Group("grep_topic_" + topic)
+	gg := goka.DefineGroup(group,
+		goka.Input(topic, codec, sseInGrepView.GrepMessage),
+		goka.Output(topicGrepMatch, JSONCodec{ValueGrepMatch{}}),
+	)
+	p, err := goka.NewProcessor(brokers, gg, goka.WithConsumerBuilder(goka_confluent.NewConsumerBuilder(1000)))
+	if err != nil {
+		panic("Failed to create grepTopic processor: " + err.Error())
+	}
+	err := p.Start()
+	if err != nil {
+		panic("grepTopic processor died: " + err.Error())
+	}
+}
+
+func (sseInGrepView *SSEInGrepView) GrepMessage(ctx goka.Context, msg interface{}) {
+	// TODO lock-free version of this
+	msgInfo := ctx.Info()
+	matches := sseInGrepView.greps[grepTopicPartition{msgInfo.Topic, msgInfo.Partition}].GrepMessage(
+		msgInfo.Offset, msgSize(msg), ctx.Key(), msg,
+	)
+	for _, match := range matches {
+		ctx.Emit(topicGrepMatch, match.k.String(), match.v)
+	}
+}
+
 func main() {
+	brokers := []string{"localhost:9092"}
 	grepStreamsAPI := GrepStreamsAPI{
 		StreamTopic:       "sse_out_grep",
 		GroupName:         "grep-streams",
 		NodeName:          "localhost",
-		Brokers:           []string{"localhost:9092"},
+		Brokers:           brokers,
 		WriteChannelDepth: 10,  // consumer -> sink() loop buffer
 		SinkChanDepth:     0,   // i.e., don't ack messages that haven't been written to TCP window
 		DoneChanDepth:     5,   // non-zero allows goroutines to exit sooner
@@ -427,6 +576,9 @@ func main() {
 	server := http.Server{Handler: &grepStreamsAPI, Addr: ":8443"}
 	go grepStreamsAPI.Consume(func() { server.Close() })
 	go grepStreamsAPI.Produce()
+	sseInGrepView := NewSSEInGrepView("grep-streams", topicSSEInGrep, JSONCodec{ValueSSEInGrep{}})
+	go sseInGrepView.Start(nil)
+	go sseInGrepView.grepTopic("greps", dummyCodec, brokers)
 	err := server.ListenAndServeTLS("localhost.crt", "localhost.key")
 	if err != nil {
 		log.Printf("unclean shutdown! err=%v\n", err)

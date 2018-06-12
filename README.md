@@ -141,7 +141,7 @@ View of:
   * `grep_match_epoch` topic (also written)
 
 emits:
-  * `grep_match` topic - periodically compacted ranges and tombstones
+  * `grep_match_seq` topic - periodically compacted ranges and tombstones
 
 Local State:
   * buffer of grep_match rows which could not be written to
@@ -180,8 +180,8 @@ as the matches come in.
 
 Things not going well, it punts requests for old ranges to grep-logs
 
-consumes via global lookup table:
-  * `sse_in_grep`
+consumes via global view:
+  * `sse_in_grep
 
 consumes/joins (partitioned over <topic:filter>):
   * `grep_match_seq`
